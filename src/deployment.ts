@@ -45,6 +45,8 @@ export function machineOf(config: DeploymentConfig): Machine {
 export const GithubAccountsSchema = z.object({
   repository: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?$/, 'owner/name').default(''),
   cli: z.string().trim().default(''),
+  /** Private key of the agent account, for SSH access to github.com; empty keeps the HTTPS credential-helper path. */
+  sshKey: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for HTTPS').default(''),
 })
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
@@ -52,7 +54,7 @@ export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { githu
 
 export interface Deployment extends Machine {
   repository: string
-  github: { cli: string; login: string; noreply: string }
+  github: { cli: string; login: string; noreply: string; sshKey: string }
   feishu?: FeishuBot
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
@@ -83,6 +85,19 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   const result = schema.safeParse(value)
   return result.success ? result.data : undefined
 }
+/**
+ * Verifies that the agent's SSH key is a private key file ssh accepts: present, a regular file, readable, and closed to
+ * other users, because ssh refuses a key wider than its owner.
+ */
+export function checkSshKey(file: string): void {
+  let stats
+  try { stats = statSync(file) } catch { throw new SetupError('sshKeyMissing', { key: file }) }
+  if (!stats.isFile()) throw new SetupError('sshKeyMissing', { key: file })
+  try { accessSync(file, constants.R_OK) } catch { throw new SetupError('sshKeyMissing', { key: file }) }
+  const mode = stats.mode & 0o777
+  if (mode & 0o077) throw new SetupError('sshKeyPermissions', { key: file, mode: `0${mode.toString(8)}` })
+}
+
 /** Verify the agent's GitHub CLI identity and push access to the configured repository. */
 export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
   const { stateDir } = machine
@@ -90,6 +105,9 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   const remote = accounts.repository
   if (!remote) throw new SetupError('repositoryUnset')
   if (!accounts.cli) throw new SetupError('agentCliUnset')
+  const { sshKey } = accounts
+  // Checked before the CLI probes so a mistyped or over-shared key fails here rather than in every worker's git.
+  if (sshKey) checkSshKey(sshKey)
   let cli: string
   try { cli = executable(accounts.cli, path, workerBin(stateDir)) } catch (error) { throw new SetupError('agentCliMissing', { output: reason(error) }) }
   const text = await probe([cli, 'api', 'user']).catch((error: unknown) => { throw new SetupError('agentCliSignedOut', { output: reason(error) }) })
@@ -102,7 +120,7 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   if (!access) throw new SetupError('repositoryUnreported', { repository: remote })
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
-  return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+  return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com`, sshKey } }
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })

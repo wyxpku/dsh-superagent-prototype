@@ -60,7 +60,7 @@ describe('setup', () => {
   it('reads the repository from the GitHub Source and the accounts from their CLIs, skipping the worker shims', async () => {
     const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)
     expect(deployment).toMatchObject({ repository: 'acme/widgets', github: { cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
-    expect(deployment.github).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' })
+    expect(deployment.github).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com', sshKey: '' })
     expect(deployment).not.toHaveProperty('feishu')
     // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
     expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
@@ -82,6 +82,21 @@ describe('setup', () => {
     await needs('github', 'repositoryUnreadable', { account: 'Agent-Bot', repository: 'acme/widgets', output }, { repository, cli: unreadable })
     await needs('github', 'agentCliNoAccount', {}, { repository, cli: program(join(dir, 'bin', 'gh-anonymous'), `echo '{}'`) })
     expect(() => executable('nothing-here', join(dir, 'bin'))).toThrow('nothing-here is not an executable file on PATH')
+  })
+  it('takes an agent SSH key only as a private, readable file, and passes it through to the deployment', async () => {
+    const key = join(dir, 'id_agent')
+    writeFileSync(key, 'PRIVATE', { mode: 0o600 })
+    expect((await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh', sshKey: key }, probe, path)).github.sshKey).toBe(key)
+    const refuses = async (code: string, values: Record<string, unknown>, sshKey: unknown) =>
+      expect(resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh', sshKey }, probe, path)).rejects.toEqual(setupError('github', code, values))
+    await refuses('sshKeyMissing', { key: join(dir, 'missing') }, join(dir, 'missing'))
+    await refuses('sshKeyMissing', { key: dir }, dir)
+    // ssh itself refuses a key other users can read, so setup says so instead of letting every worker's git fail.
+    chmodSync(key, 0o644)
+    await refuses('sshKeyPermissions', { key, mode: '0644' }, key)
+    chmodSync(key, 0o600)
+    // A relative path cannot mean the same file to a worker started in another directory.
+    await expect(resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh', sshKey: 'id_agent' }, probe, path)).rejects.toThrow('An absolute path, or empty for HTTPS')
   })
   it('reads the Feishu bot from a bot-only lark-cli, or finds none when the Feishu Source names no CLI', async () => {
     expect(await resolveFeishuBot(machine(), {}, probe, path)).toBeUndefined()

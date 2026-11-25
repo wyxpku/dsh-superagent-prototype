@@ -46,6 +46,44 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
 
+3. Where github.com needs a proxy, export it inside that wrapper, and nowhere else. dsh-superagent never reads a proxy setting of its own: the host's own git, the model calls, Feishu and the worker shells must keep their direct path, while `gh` is the only process that should take the proxy. Every `gh` call reaches the wrapper, because the GitHub Source's CLI is resolved to an absolute path and the worker `gh` shim execs the same file.
+
+   ```sh
+   cat > ~/.local/bin/gh-agent <<'EOF'
+   #!/bin/sh
+   # Proxy only for this exec'd gh; a closed port falls back to a direct connection.
+   proxy="http://127.0.0.1:10808"
+   host=${proxy#*://}; host=${host%%:*}; port=${proxy##*:}
+   if [ -n "$host" ] && [ -n "$port" ] && nc -z -G 1 "$host" "$port" >/dev/null 2>&1; then
+     HTTPS_PROXY=$proxy HTTP_PROXY=$proxy NO_PROXY=localhost,127.0.0.1,::1
+     export HTTPS_PROXY HTTP_PROXY NO_PROXY
+   fi
+   GH_CONFIG_DIR="$HOME/.config/gh-agent" exec gh "$@"
+   EOF
+   ```
+
+   `gh` honours `HTTPS_PROXY`; git does not read these variables unless they are in its own environment, which they are not. A worker that runs `git fetch` therefore keeps the transport its git config names, and a worker that runs `gh` takes the proxy. `nc -G` is the BSD and macOS connection timeout; GNU netcat spells it `-w`.
+
+### Agent SSH key (optional)
+
+Workers reach github.com over HTTPS by default, authenticated by the agent's CLI as a credential helper. When HTTPS to github.com is unreliable, give the agent account its own SSH key instead, and set its path in the **Agent SSH private key** field of the GitHub card:
+
+```sh
+ssh-keygen -t ed25519 -C agent@example.com -f ~/.ssh/id_dsh_agent -N ''
+gh-agent ssh-key add ~/.ssh/id_dsh_agent.pub --title "dsh-superagent"
+chmod 600 ~/.ssh/id_dsh_agent
+```
+
+The key must belong to the same account as `gh-agent`, must be a regular file, must not be readable by other users, and must have no passphrase, because worker git runs unattended and cannot answer a prompt. Setup checks the mode, authenticates once with `ssh -T git@github.com`, and refuses a key that GitHub greets as another account. That check is what keeps the agent from pushing as the operator or as a second account.
+
+With a key set, worker git rewrites `https://github.com/…` addresses to SSH, so a remote written either way reaches the same account, and `core.sshCommand` points at an ssh configuration of its own:
+
+- Only that key is offered (`IdentitiesOnly yes`); the operator's `~/.ssh/config`, `ProxyCommand` and `ssh-agent` keys take no part, and prompts are off.
+- Host keys come from the usual `~/.ssh/known_hosts`, and the first connection records an unknown one (`StrictHostKeyChecking accept-new`). To trust a host key ahead of time, add it there, or pin it with `ssh-keyscan github.com >> ~/.ssh/known_hosts`.
+- Because the configuration replaces `~/.ssh/config` for worker git, its aliases do not apply to workers either; write remotes as full addresses.
+
+Leave the field empty to keep the HTTPS credential helper, which is also what a git without SSH support of the agent account needs.
+
 ### Feishu bot (optional)
 
 1. Create a self-built app with the bot capability. Grant it the permissions to receive message events, read and send chat messages, and read chat members, then publish the app version.
@@ -144,7 +182,7 @@ Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` i
 
 Setup must succeed before polling or work starts. Overview lists missing requirements and links to their settings. A settings change runs setup again. If you fix something outside the application, such as CLI authentication, choose **Check again**.
 
-1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
+1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. To reach github.com over SSH instead of the agent's HTTPS credential, also set **Agent SSH private key**; see [Agent SSH key](#agent-ssh-key-optional). Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
 2. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts and Feishu users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
 3. **Execution.** The directory root and a prepare command. To give each Ticket a checkout of the repository:
 
@@ -152,6 +190,8 @@ Setup must succeed before polling or work starts. Overview lists missing require
    git -C /home/me/src/widgets fetch --no-tags "https://github.com/$DSH_SUPERAGENT_GITHUB_REPOSITORY.git" "${DSH_SUPERAGENT_GITHUB_PR_HEAD:-HEAD}:refs/dsh-superagent/$DSH_SUPERAGENT_TICKET" &&
    git -C /home/me/src/widgets worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
    ```
+
+   The command runs with the worker environment, so it needs neither a credential helper nor SSH options of its own: with an **Agent SSH private key** set, the same URLs are fetched over SSH as the key's account, and without one they use the agent's HTTPS credential.
 
    List personal CLIs, such as one signed in to your own account, as blocked commands.
 4. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
@@ -199,7 +239,7 @@ A refusal has a status and `error`, its English text:
 
 The blocks:
 
-- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
+- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository`, `cli` and `sshKey` (empty for HTTPS), and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
 - `executor`: `model`, `maxWorkers`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
@@ -217,14 +257,15 @@ curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json
 
 Setup uses the DeepSeek Harness subprocess service, as worker shells do. It removes environment variables whose names contain KEY, PASSWORD, SECRET or TOKEN.
 
-Setup verifies the GitHub repository and the agent's push access, writes the worker environment, and checks that git uses only the agent credentials for github.com. A Feishu setup failure disables only the Feishu Source.
+Setup verifies the GitHub repository and the agent's push access, writes the worker environment, and checks that git uses only the agent credentials for github.com. With an agent SSH key, it also checks that the key authenticates to GitHub as the same account as the CLI. A Feishu setup failure disables only the Feishu Source.
 
 The process environment that setup writes:
 
 - **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
-- **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
+- **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. With an agent SSH key it instead rewrites `https://github.com/…` addresses to SSH and sets `core.sshCommand` to `<stateDir>/worker-sshconfig`, the key's own ssh configuration. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
+- **ssh configuration** in `<stateDir>/worker-sshconfig`, only while an agent SSH key is set: names that key for github.com and nothing else, as described under [Agent SSH key](#agent-ssh-key-optional).
 
-A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
+A file in `worker-bin`, `worker-gitconfig` or `worker-sshconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
 ## Try it
 
@@ -258,8 +299,11 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `The GitHub Source names no repository.` | Set the repository, `owner/name`, on the GitHub card |
 | A Ticket fails with `The prepare command failed: …` | The output names the cause, such as a wrong clone path; fix the command, then retry the Ticket |
 | `git does not read the github.com credential configuration dsh-superagent writes` | Install git 2.32 or later |
+| `The agent SSH key … does not exist` or `is accessible to other users` | Point **Agent SSH private key** at the agent's private key file, and make it private with `chmod 600` |
+| `The agent SSH key … could not authenticate to github.com.` | Add the key's public half to the agent GitHub account, and check that `ssh -T git@github.com` with that key greets the agent |
+| `The agent SSH key … authenticates to GitHub as @…, but the agent GitHub CLI acts as @…` | Use the key of the account `gh-agent` is signed in to, or sign the CLI in to the key's account; workers must push as one account |
 | A Ticket fails with `The git configuration of the repository in … sets …` | Remove the named credential or `http.*.extraheader` settings from the clone's `.git/config` |
-| `… was not written by dsh-superagent` | Move the named file out of `<stateDir>/worker-bin` or `<stateDir>/worker-gitconfig`, or choose another `stateDir` |
+| `… was not written by dsh-superagent` | Move the named file out of `<stateDir>/worker-bin`, `<stateDir>/worker-gitconfig` or `<stateDir>/worker-sshconfig`, or choose another `stateDir` |
 | `The bot lark-cli allows user identities` | Point the Feishu Source at a bot-only configuration, as in Feishu bot above |
 | `The bot lark-cli does not work.` or `The bot identity of app … is …` | Check the configuration's app id and secret |
 | `The Feishu bot is not a member of the chat.` | Add the bot to the chat in the chat's settings; the next attempt succeeds |
