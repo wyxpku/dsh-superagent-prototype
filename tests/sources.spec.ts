@@ -56,6 +56,12 @@ function emptyRegistry(): SourceRegistry {
 }
 const subscribed = (h: ReturnType<typeof host>, ref: { source: string; id: string }, meta: Record<string, unknown> = {}) =>
   h.store.threads.save({ key: `${ref.source}:${ref.id}`, ref, createdAt: new Date().toISOString(), subscriptions: ['ticket'], correlated: [], pending: [], meta })
+/** Changes the Feishu Source's configuration without replacing the rest of the settings. */
+const setFeishuConfig = (h: ReturnType<typeof host>, config: Record<string, unknown>): void => {
+  const settings = h.store.settings()
+  h.store.saveSettings({ ...settings, sources: { ...settings.sources,
+    feishu: { enabled: true, config: { ...settings.sources.feishu?.config, ...config } } } })
+}
 const openTicket = (id: string): Ticket => ({ id, title: id, decisionId: `d-${id}`, mandate: { strength: 'explicit', policyVersion: '',
   basis: { via: 'listed' }, actor: { source: 'github', id: 'alice' }, scope: '' },
   channels: [], assignments: [], inputs: [], undelivered: [], createdAt: '', updatedAt: '', origin: { triggerId: `source-${id}`, triggerIds: [] } })
@@ -90,6 +96,12 @@ function github(h: ReturnType<typeof host>, routes: Record<string, unknown>): st
 }
 const bare = (reads: string[]) => reads.map(path => path.split('?')[0])
 describe('feishu source', () => {
+  it('defaults the polling interval and thread active time, and accepts overrides within their limits', () => {
+    expect(feishuKind.schema.parse({})).toMatchObject({ pollSeconds: 120, threadActiveHours: 24 })
+    expect(feishuKind.schema.parse({ pollSeconds: 60, threadActiveHours: 48 })).toMatchObject({ pollSeconds: 60, threadActiveHours: 48 })
+    expect(() => feishuKind.schema.parse({ pollSeconds: 30 })).toThrow()
+    expect(() => feishuKind.schema.parse({ threadActiveHours: 0 })).toThrow()
+  })
   it('registers its kind without a bot, and names on its health what setup still needs', async () => {
     const run = async (overrides: Partial<SourceContextDeps>) => {
       // The fixture's registry already holds the kind; this one starts empty so the plugin's registration shows.
@@ -197,6 +209,23 @@ describe('feishu source', () => {
     expect(lark).toHaveBeenCalled()
     h.store.close()
   })
+  it('stops polling a quiet Thread after the configured active time', async () => {
+    const h = host()
+    const source = feishuTrigger({ message_id: 'om_root', chat_id: 'oc_1', chat_type: 'group', sender_id: MEMBER, sender_type: 'user',
+      content: 'fix', create_time: '1' }, 'ou_bot', 'cli_bot')!
+    h.store.triggers.save(source)
+    subscribed(h, source.threads[0]!)
+    h.store.threads.save({ ...h.store.threads.get('feishu:oc_1:om_root')!,
+      lastAt: new Date(Date.now() - 3 * 24 * 3600_000).toISOString() })
+    const lark = vi.spyOn(h.commands, 'lark').mockResolvedValue({ items: [] })
+    setFeishuConfig(h, { threadActiveHours: 48 })
+    await pollFeishuThreads(h)
+    expect(lark).not.toHaveBeenCalled()
+    setFeishuConfig(h, { threadActiveHours: 4 * 24 })
+    await pollFeishuThreads(h)
+    expect(lark).toHaveBeenCalled()
+    h.store.close()
+  })
   it('keeps a quiet topic in history recovery while a subscribed Thread that is polled follows it', async () => {
     const h = host()
     const day = 24 * 3600_000
@@ -284,6 +313,19 @@ describe('feishu source', () => {
     expect(scans).toHaveLength(1 + 14)
     expect(Object.keys(h.store.get<Record<string, string>>('feishu-history-threads:oc_team')!)).toHaveLength(14)
     expect(h.store.get<Record<string, string>>('feishu-history-threads:oc_team')!.omt_29).toBe(new Date(start + 29 * day).toISOString())
+    h.store.close()
+  })
+  it('forgets history topics older than the configured active time, and keeps newer ones', async () => {
+    const h = host()
+    const now = Date.now()
+    const old = new Date(now - 3 * 3600_000).toISOString()
+    const recent = new Date(now - 3600_000).toISOString()
+    h.store.set('feishu-history-threads:oc_team', { omt_old: old, omt_recent: recent })
+    vi.spyOn(h.commands, 'withSignal').mockReturnValue(h.commands)
+    vi.spyOn(h.commands, 'lark').mockResolvedValue({ has_more: false, items: [] })
+    await backfillChat(h, 'oc_team', false, new Date(now - 60_000).toISOString(), new Date(now).toISOString(),
+      new AbortController().signal, { skipped: 0 }, 2 * 3600_000)
+    expect(h.store.get('feishu-history-threads:oc_team')).toEqual({ omt_recent: recent })
     h.store.close()
   })
   it('skips and counts a history message it cannot read, and takes in the others', async () => {

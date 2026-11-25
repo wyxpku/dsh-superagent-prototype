@@ -21,6 +21,8 @@ const MembersSchema = z.looseObject({
 const FeishuConfigSchema = FeishuBotSchema.extend({
   readPageSize: z.number().int().min(1).max(50).default(20),
   linkTimeoutMs: z.number().int().min(1).max(90000).default(5000),
+  pollSeconds: z.number().int().min(60).max(3600).default(120),
+  threadActiveHours: z.number().int().min(1).max(720).default(24),
   chats: z.array(z.object({ chatId: z.string().regex(/^oc_[a-zA-Z0-9]+$/), name: z.string().trim().max(60).optional(), listen: z.enum(['mentions', 'all']) }).strict())
     .refine(chats => new Set(chats.map(chat => chat.chatId)).size === chats.length, 'Duplicate chat IDs')
     .default([]),
@@ -46,6 +48,10 @@ export const feishuKind: SourceKind<FeishuConfig> = {
     { key: 'otherChats', type: 'select', label: { zh: '其他群', en: 'Other chats' }, options: [{ value: 'none', label: { zh: '不接收', en: 'Not received' } }, { value: 'mentions', label: { zh: '仅 @', en: '@ only' } }],
       hint: { zh: '机器人已加入、但没列在上面的群。“仅 @”接收那里 @ 机器人的消息；谁的消息能发起工作看策略里的准入。', en: 'Chats the bot has joined that are not listed above. "@ only" receives messages there that mention the bot; whose messages may originate work is the Policy\'s admission.' } },
     { key: 'directMessages', type: 'switch', label: { zh: '接收私聊', en: 'Direct messages' } },
+    { key: 'pollSeconds', type: 'number', advanced: true, min: 60, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' },
+      hint: { zh: '补收群历史和轮询订阅线程的最小间隔。实时消息仍由事件订阅即时接收。', en: 'Minimum interval between history recovery and subscribed-Thread polls. Live messages still arrive through the event subscription.' } },
+    { key: 'threadActiveHours', type: 'number', advanced: true, min: 1, max: 720, label: { zh: '线程活跃时间 / 小时', en: 'Thread active time / hours' },
+      hint: { zh: '没有进行中工单的线程，在最后一次消息或工单结束后继续轮询多久；超过后不再轮询，实时消息仍会送达。', en: 'How long a Thread with no live Ticket keeps being polled after its last message or Ticket end; after that it is no longer polled, though live messages still arrive.' } },
     { key: 'readPageSize', type: 'number', advanced: true, min: 1, max: 50, label: { zh: '每页消息数', en: 'Messages per page' }, hint: { zh: '智能体读取线程和群历史时，每页的消息数。', en: 'Messages per page when agents read Threads and chat history.' } },
     { key: 'linkTimeoutMs', type: 'number', advanced: true, min: 1, max: 90000, label: { zh: '原消息链接的查询时限 / 毫秒', en: 'Original message link time limit / ms' },
       hint: { zh: '查询原消息链接最多等待的时间；超时后智能体改为直接读取原消息。', en: 'How long to wait for an original message\'s link; after that, agents read the message itself.' } },
