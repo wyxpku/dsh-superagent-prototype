@@ -5,8 +5,8 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
-  from '../src/infra/environment.ts'
+import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, verifyEnvironment, withoutDirectory, workerBin, workerGitConfig,
+  workerSshConfig, writeEnvironment } from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
@@ -94,6 +94,44 @@ describe('agent git configuration', () => {
     await git('-C', 'repo', '-c', 'user.name=Alice', '-c', 'user.email=alice@example.com', 'commit', '--allow-empty', '-q', '-m', 'with identity')
     expect(await git('-C', 'repo', 'log', '-1', '--format=%an <%ae> / %cn <%ce>')).toBe('Alice <alice@example.com> / Alice <alice@example.com>')
   })
+  it('reaches github.com over SSH with the agent key when the deployment names one', async () => {
+    const key = join(dir, 'id_agent'); writeFileSync(key, 'PRIVATE KEY', { mode: 0o600 })
+    const base = testDeployment()
+    const deployment = testDeployment({ stateDir: dir, github: { ...base.github, cli: '/opt/agent tools/gh', sshKey: key } })
+    await writeEnvironment(deployment, [])
+    // The ssh configuration names only the agent key, so the operator's ~/.ssh/config and ssh-agent keys take no part.
+    expect(readFileSync(workerSshConfig(dir), 'utf8')).toBe([
+      '# Written by dsh-superagent on every start; edits are lost.',
+      'Host github.com', '\tUser git', `\tIdentityFile "${key}"`, '\tIdentitiesOnly yes', '\tBatchMode yes',
+      '\tStrictHostKeyChecking accept-new', '\tConnectTimeout 15', '',
+    ].join('\n'))
+    const env = workerEnv({ PATH: process.env.PATH, HOME: dir, ...agentVariables(dir) })
+    const git = async (...args: string[]): Promise<string> => (await exec('git', args, { cwd: dir, env })).stdout.trim()
+    await git('init', '-q', 'repo')
+    // A remote written as HTTPS and one written as SSH both reach github.com as the key's account.
+    await exec('git', ['-C', 'repo', 'remote', 'add', 'origin', 'https://github.com/acme/widgets.git'], { cwd: dir, env })
+    await exec('git', ['-C', 'repo', 'remote', 'add', 'upstream', 'git@github.com:acme/widgets.git'], { cwd: dir, env })
+    expect([await git('-C', 'repo', 'remote', 'get-url', '--push', 'origin'), await git('-C', 'repo', 'remote', 'get-url', '--push', 'upstream')])
+      .toEqual(['git@github.com:acme/widgets.git', 'git@github.com:acme/widgets.git'])
+    expect(await git('config', '--get', 'core.sshCommand')).toBe(`ssh -F ${workerSshConfig(dir)}`)
+    // The credential helper stays for anything that still asks git for HTTPS credentials.
+    expect(await git('config', '--show-origin', '--get-all', 'credential.https://github.com.helper'))
+      .toBe(`file:${workerGitConfig(dir)}\t${credentialHelper('/opt/agent tools/gh')}`)
+  })
+  it('removes the ssh configuration, and names no ssh command, when the deployment stops naming a key', async () => {
+    const key = join(dir, 'id_agent'); writeFileSync(key, 'PRIVATE KEY', { mode: 0o600 })
+    const base = testDeployment({ stateDir: dir })
+    await writeEnvironment(testDeployment({ stateDir: dir, github: { ...base.github, sshKey: key } }), [])
+    expect(readFileSync(workerSshConfig(dir), 'utf8')).toContain(`IdentityFile "${key}"`)
+    await writeEnvironment(base, [])
+    expect(() => readFileSync(workerSshConfig(dir))).toThrow()
+    expect(readFileSync(workerGitConfig(dir), 'utf8')).not.toContain('sshCommand')
+  })
+  it('refuses to remove a worker ssh configuration it did not write', async () => {
+    writeFileSync(workerSshConfig(dir), 'foreign\n', { mode: 0o644 })
+    await expect(writeEnvironment(testDeployment({ stateDir: dir }), [])).rejects.toMatchObject({
+      place: 'deployment', code: 'foreignFile', values: { file: workerSshConfig(dir) } })
+  })
 })
 
 it('fails instead of asking the operator\'s askpass helpers when the agent\'s credential helper has no answer', async () => {
@@ -130,6 +168,37 @@ const subprocess = (config: string): SubprocessRuntime => ({
     return { done, collected: { stdout: reader('stdout'), stderr: reader('stderr') } }
   },
 }) as unknown as SubprocessRuntime
+describe('ssh identity check', () => {
+  const signal = new AbortController().signal
+  const key = (): string => join(dir, 'id_agent')
+  // github.com greets a successful handshake on stderr and exits non-zero, so the stand-in does the same.
+  const greeting = (body: string): void => { program(join(dir, 'real', 'ssh'), body) }
+  const deployment = () => testDeployment({ stateDir: dir, github: { ...testDeployment().github, sshKey: key() } })
+  beforeEach(() => { writeFileSync(key(), 'PRIVATE KEY', { mode: 0o600 }) })
+  afterEach(() => { vi.unstubAllEnvs() })
+  const check = async () => {
+    // The stand-in ssh is found by name, as the worker's git invokes it; the system's git stays behind it.
+    vi.stubEnv('PATH', [join(dir, 'real'), process.env.PATH ?? ''].join(':'))
+    const value = deployment()
+    await writeEnvironment(value, [])
+    return verifyEnvironment(value, subprocess(workerGitConfig(dir)), signal)
+  }
+  it('accepts a key github.com greets as the account the agent CLI acts as, whatever the greeting\'s case', async () => {
+    greeting('echo "Hi Agent-Bot! You\'ve successfully authenticated, but GitHub does not provide shell access." >&2; exit 1')
+    await expect(check()).resolves.toBeUndefined()
+  })
+  it('refuses a key that authenticates as another account, which would push under two identities', async () => {
+    greeting('echo "Hi someone-else! You\'ve successfully authenticated, but GitHub does not provide shell access." >&2; exit 1')
+    await expect(check()).rejects.toMatchObject({ place: 'github', code: 'sshIdentityMismatch',
+      values: { key: key(), account: 'someone-else', login: 'agent-bot' } })
+  })
+  it('reports ssh\'s own output when the key does not authenticate at all, instead of a wrong account', async () => {
+    greeting('echo "git@github.com: Permission denied (publickey)." >&2; exit 255')
+    await expect(check()).rejects.toMatchObject({ place: 'github', code: 'sshUnreachable',
+      values: { key: key(), output: 'git@github.com: Permission denied (publickey).' } })
+  })
+})
+
 describe('ticket directory check', () => {
   const signal = new AbortController().signal
   const env = () => gitEnv({ GIT_CONFIG_GLOBAL: join(dir, 'global'), GIT_CONFIG_NOSYSTEM: '1' })

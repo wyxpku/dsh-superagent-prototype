@@ -10,6 +10,7 @@ import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
+import { sameName } from './text.ts'
 
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
@@ -18,6 +19,7 @@ const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Wr
 export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'lark-cli']
 export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bin')
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
+export const workerSshConfig = (stateDir: string): string => join(stateDir, 'worker-sshconfig')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => `\\${char}`)}"`
 export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
@@ -71,6 +73,44 @@ async function own(file: string, text: string, mode = 0o644): Promise<void> {
   await writeFile(temporary, text, { mode })
   await rename(temporary, file)
 }
+/** Removes a file dsh-superagent wrote, refusing a foreign file; a missing file is fine. */
+async function removeOwned(file: string): Promise<void> {
+  let owned: boolean
+  try { owned = await written(file) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  if (!owned) throw new SetupError('foreignFile', { file })
+  await unlink(file)
+}
+
+/**
+ * The isolated ssh configuration workers use for github.com. It replaces the operator's `~/.ssh/config` for worker git,
+ * so no operator alias, agent key or `ProxyCommand` applies, and `IdentitiesOnly` offers only the agent's key. Host keys
+ * still come from the usual `~/.ssh/known_hosts`, and the first connection to an unknown host records its key there.
+ */
+const sshConfig = (key: string): string => [
+  MARKER,
+  'Host github.com',
+  '\tUser git',
+  // ssh reads the same double-quoted form git writes: the path may contain spaces.
+  `\tIdentityFile ${gitQuote(key)}`,
+  '\tIdentitiesOnly yes',
+  '\tBatchMode yes',
+  '\tStrictHostKeyChecking accept-new',
+  '\tConnectTimeout 15',
+].join('\n') + '\n'
+
+/**
+ * The transport lines of the worker git config. With an SSH key, github.com is reached over SSH as the agent account:
+ * `core.sshCommand` points git at the key's own ssh config, and HTTPS addresses are rewritten to SSH so a remote written
+ * either way lands on the same identity. Without one, workers keep the HTTPS credential helper, and the reverse rewrite
+ * keeps SSH addresses off whatever keys the operator's ssh would otherwise offer.
+ */
+const transport = (stateDir: string, sshKey: string): string[] => sshKey
+  ? ['[core]', `\tsshCommand = ssh -F ${gitQuote(workerSshConfig(stateDir))}`,
+    '[url "git@github.com:"]', '\tinsteadOf = https://github.com/', '\tinsteadOf = ssh://git@github.com/']
+  : ['[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com/']
 
 /**
  * Atomically writes worker CLI shims and the isolated git configuration file into the state directory, refusing to overwrite foreign files.
@@ -78,6 +118,7 @@ async function own(file: string, text: string, mode = 0o644): Promise<void> {
  */
 export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'repository' | 'github' | 'feishu'>, blockedCommands: readonly string[]): Promise<void> {
   const { stateDir, repository, github, feishu } = deployment
+  const { sshKey } = github
   const dir = workerBin(stateDir)
   await mkdir(dir, { recursive: true })
   const before = await readdir(dir)
@@ -109,10 +150,14 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     '[user]', '\tuseConfigOnly = true',
     '[credential]', '\thelper =',
     '[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
-    '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com/',
+    ...transport(stateDir, sshKey),
     // Include Git LFS filters because the operator's global gitconfig (which usually holds them) is ignored.
     '[filter "lfs"]', '\tclean = git-lfs clean -- %f', '\tsmudge = git-lfs smudge -- %f', '\tprocess = git-lfs filter-process', '\trequired = true',
   ].join('\n') + '\n')
+  // The ssh config exists only while an SSH key is configured, so switching back to HTTPS removes the one dsh-superagent
+  // wrote (and refuses a foreign file), leaving nothing behind that `core.sshCommand` used to name.
+  if (sshKey) await own(workerSshConfig(stateDir), sshConfig(sshKey))
+  else await removeOwned(workerSshConfig(stateDir))
 }
 
 /** Applies environment overrides and prepends worker shims to `process.env.PATH`, returning a restore callback. */
@@ -134,12 +179,27 @@ export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[],
   throw new CliError(read(handle.collected.stderr).trim() || `${argv.join(' ')} ${ended}`, undefined, exitCode ?? undefined)
 }
 
-/** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
+/**
+ * Verifies that the agent's SSH key authenticates to github.com as the account the agent CLI acts as. GitHub greets a
+ * successful handshake on stderr and exits non-zero, so the greeting, not the status, decides; a missing greeting is
+ * reported with ssh's own output rather than as a wrong account.
+ */
+async function verifySshIdentity(key: string, login: string, stateDir: string, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+  // `runAsWorker` reports stderr as the error for a non-zero exit, which is how ssh exits after a greeting too.
+  const output = await runAsWorker(subprocess, ['ssh', '-F', workerSshConfig(stateDir), '-T', 'git@github.com'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+    .catch((error: unknown) => { if (error instanceof CliError) return error.message; throw error })
+  const account = /Hi ([A-Za-z0-9-]+)!/.exec(output)?.[1]
+  if (!account) throw new SetupError('sshUnreachable', { key, output: output.trim() })
+  if (!sameName(account, login)) throw new SetupError('sshIdentityMismatch', { key, account, login })
+}
+
+/** Verifies that worker git invocations resolve the deployment's GitHub credential helper, and authenticate over SSH when a key is set. */
 export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
   const { github, stateDir } = deployment
   // `-z` separates fields with NUL and never quotes paths.
   const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
   if (helpers.join('\0') !== [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')) throw new SetupError('gitTooOld')
+  if (github.sshKey) await verifySshIdentity(github.sshKey, github.login, stateDir, subprocess, signal)
 }
 
 /**
