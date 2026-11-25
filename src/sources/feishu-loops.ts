@@ -113,16 +113,17 @@ export async function refreshChatNames(ctx: SourceContext, signal?: AbortSignal)
   ctx.state.set(KV.sources.labels(SOURCE), names)
   return names
 }
-/** Rereads the chat list every minute independently of history backfill (whose rounds can take much longer), so newly joined chats appear within a minute. */
+/** Rereads the chat list on the configured polling interval, independently of history backfill (whose rounds can take much longer), so newly joined chats appear within that interval. */
 async function chatNamesLoop(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   await ctx.ready
   if (!available(ctx)) return
   while (!signal.aborted) {
-    if (enabled(ctx)) {
+    const config = enabled(ctx)
+    if (config) {
       try { await refreshChatNames(ctx, signal) }
       catch { /* Names are a display aid; the stored list stays until a later read succeeds. */ }
     }
-    await delay(60_000, undefined, { signal }).catch(() => {})
+    await delay((config?.pollSeconds ?? 60) * 1000, undefined, { signal }).catch(() => {})
   }
 }
 async function backfillLoop(ctx: SourceContext, signal: AbortSignal): Promise<void> {
@@ -138,6 +139,7 @@ async function backfillLoop(ctx: SourceContext, signal: AbortSignal): Promise<vo
     const seen = ctx.state.get(KV.feishu.chats) ?? {}
     const known = Object.entries(seen).filter(([, direct]) => direct && config.directMessages)
     const chats = { ...Object.fromEntries(config.chats.map(chat => [chat.chatId, false])), ...Object.fromEntries(known) }
+    const horizonMs = config.threadActiveHours * 3600_000
     const errors: string[] = []
     const tally = { skipped: 0 }
     for (const [chatId, direct] of Object.entries(chats)) {
@@ -147,24 +149,24 @@ async function backfillLoop(ctx: SourceContext, signal: AbortSignal): Promise<vo
       const since = ctx.state.get(cursorKey)
       if (since === undefined) { ctx.state.set(cursorKey, started); continue }
       try {
-        await backfillChat(ctx, chatId, direct, since, started, signal, tally)
+        await backfillChat(ctx, chatId, direct, since, started, signal, tally, horizonMs)
         if (!signal.aborted) ctx.state.set(cursorKey, cursorAt(started))
       } catch (error) { if (!signal.aborted) errors.push(`${chatId}: ${String(error)}`) }
     }
-    await pollThreads(ctx, signal, tally)
+    await pollThreads(ctx, signal, tally, horizonMs)
     const skipped = tally.skipped ? `; ${tally.skipped} unreadable messages skipped` : ''
     if (!signal.aborted) ctx.report('history', errors.length
       ? { state: 'error', detail: errors.join('\n') }
       : { state: 'ready', detail: `Configured groups and known direct chats recovered${skipped}`, at: new Date().toISOString() })
-    await delay(60_000, undefined, { signal }).catch(() => {})
+    await delay(config.pollSeconds * 1000, undefined, { signal }).catch(() => {})
   }
 }
 /**
  * Backfills chat messages and active topic replies between `since` and `until` before the caller advances the chat cursor.
- * Topics are stored as `{ id: lastSeenAt }`, and unsubscribed topics older than the polling horizon are pruned.
+ * Topics are stored as `{ id: lastSeenAt }`, and topics older than the configured active time are pruned unless a subscribed Thread still follows them.
  */
 export async function backfillChat(ctx: SourceContext, chatId: string, direct: boolean, since: string, until: string,
-  signal: AbortSignal, tally: Tally = { skipped: 0 }): Promise<void> {
+  signal: AbortSignal, tally: Tally = { skipped: 0 }, horizonMs = POLL_HORIZON_MS): Promise<void> {
   const commands = ctx.commands.withSignal(signal)
   const topicsKey = KV.feishu.topics(chatId)
   const topics = { ...ctx.state.get(topicsKey) }
@@ -195,10 +197,10 @@ export async function backfillChat(ctx: SourceContext, chatId: string, direct: b
   }
   await scan('chat', chatId)
   // A quiet topic is forgotten unless a subscribed Thread that is still polled follows it.
-  const followed = new Set(ctx.threads.subscribed(SOURCE).filter(thread => polled(ctx, thread))
+  const followed = new Set(ctx.threads.subscribed(SOURCE).filter(thread => polled(ctx, thread, Date.now(), horizonMs))
     .map(thread => String(thread.meta.threadId ?? ctx.triggers.latest(thread.key)?.meta.threadId ?? '')))
   for (const [id, seen] of Object.entries(topics)) {
-    if (!followed.has(id) && Date.parse(until) - Date.parse(seen) >= POLL_HORIZON_MS) delete topics[id]
+    if (!followed.has(id) && Date.parse(until) - Date.parse(seen) >= horizonMs) delete topics[id]
   }
   ctx.state.set(topicsKey, topics)
   for (const id of Object.keys(topics)) await scan('thread', id)
@@ -214,9 +216,12 @@ export function threadRef(ctx: SourceContext, thread: Thread): FeishuRef | undef
   const trigger = ctx.triggers.latest(thread.key)
   return trigger ? feishuRef(trigger) : undefined
 }
-/** Polls subscribed Feishu threads within the polling horizon so replies missed by the live stream become triggers. */
-export async function pollThreads(ctx: SourceContext, signal?: AbortSignal, tally?: Tally): Promise<void> {
-  await pollEach(ctx, SOURCE, () => !!signal?.aborted, thread => pollThread(ctx, thread, signal, tally))
+/** Polls subscribed Feishu threads within the configured active time so replies missed by the live stream become triggers. */
+export async function pollThreads(ctx: SourceContext, signal?: AbortSignal, tally?: Tally, horizonMs?: number): Promise<void> {
+  const config = enabled(ctx)
+  if (!config) return
+  await pollEach(ctx, SOURCE, () => !!signal?.aborted, thread => pollThread(ctx, thread, signal, tally), undefined,
+    horizonMs ?? config.threadActiveHours * 3600_000)
 }
 async function pollThread(ctx: SourceContext, thread: Thread, signal?: AbortSignal, tally?: Tally): Promise<void> {
   const ref = threadRef(ctx, thread)
